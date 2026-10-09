@@ -1,0 +1,7 @@
+.env
+node_modules/
+dist/
+tmp/
+*.log
+coverage/
+.nyc_output/
