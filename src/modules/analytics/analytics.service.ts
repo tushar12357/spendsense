@@ -1,187 +1,221 @@
 // src/modules/analytics/analytics.service.ts
-// Analytics queries using parameterized raw SQL for PostgreSQL-specific capabilities.
-// Prisma Client is used for simple CRUD; raw SQL is used here for:
-//   - DATE_TRUNC + AT TIME ZONE for timezone-aware month bucketing
-//   - Window functions (LAG) for month-over-month trends
-//   - Multi-CTE aggregations for dashboard summary
+// Reporting queries. PostgreSQL does the aggregation (never the whole ledger in JS):
+//   - FILTER aggregates     -> several metrics from one scan of the period
+//   - generate_series + LAG -> gap-free monthly series with month-over-month deltas
+//   - AT TIME ZONE          -> month bucketing in the user's reporting timezone
+// Prisma Client is used where a query is plain CRUD; everything here is parameterised $queryRaw.
 //
-// All queries use tagged template literals ($queryRaw) — never string concatenation.
-// TRANSFERS are excluded from income/expense totals per financial rules.
-// REFUNDS reduce expense totals (not counted as income).
+// Reporting policy (docs/financial-rules.md):
+//   income        = INCOME rows only
+//   net expenses  = EXPENSE - REFUND
+//   TRANSFER rows never contribute to income, expenses, or savings.
 
+import { Prisma } from '@prisma/client';
 import { prisma } from '../../infrastructure/database/prisma';
-import { Decimal, serializeAmount } from '../../shared/utils/decimal';
-import { monthBoundaries, currentYearMonth } from '../../shared/utils/date';
+import { Decimal, ZERO, percentOf, serializeAmount, serializePercent } from '../../shared/utils/decimal';
+import {
+  addMonths,
+  currentYearMonth,
+  formatYearMonth,
+  monthBoundaries,
+  type YearMonth,
+} from '../../shared/utils/date';
+import { summarize } from './finance';
 
-// ── Types ─────────────────────────────────────────────────────────────────────
+type Money = Prisma.Decimal;
 
-interface MonthlySummaryRow {
-  total_income: Decimal;
-  total_expenses: Decimal;
-  total_refunds: Decimal;
-  transaction_count: bigint;
+export interface Period extends YearMonth {
+  from: Date;
+  to: Date;
 }
 
-interface CategoryBreakdownRow {
-  category_id: string | null;
-  category_name: string | null;
-  total: Decimal;
-  transaction_count: bigint;
+export function resolvePeriod(timezone: string, year?: number, month?: number, now: Date = new Date()): Period {
+  const ym = year && month ? { year, month } : currentYearMonth(timezone, now);
+  return { ...ym, ...monthBoundaries(ym.year, ym.month, timezone) };
 }
 
-interface TrendRow {
-  month: Date;
-  income: Decimal;
-  expenses: Decimal;
-  refunds: Decimal;
-  prev_income: Decimal | null;
-  prev_expenses: Decimal | null;
-}
+// ── Dashboard summary ──────────────────────────────────────────────────────────
 
-// ── Dashboard Summary ─────────────────────────────────────────────────────────
+export async function getDashboardSummary(userId: string, timezone: string, year?: number, month?: number) {
+  const period = resolvePeriod(timezone, year, month);
 
-export async function getDashboardSummary(userId: string, userTimezone: string) {
-  const { year, month } = currentYearMonth(userTimezone);
-  const { from, to } = monthBoundaries(year, month, userTimezone);
-
-  const rows = await prisma.$queryRaw<MonthlySummaryRow[]>`
+  const [row] = await prisma.$queryRaw<
+    Array<{
+      income: Money; expenses: Money; refunds: Money;
+      transaction_count: bigint; transfer_count: bigint; uncategorized_count: bigint;
+    }>
+  >`
     SELECT
-      COALESCE(SUM(CASE WHEN type = 'INCOME'  THEN amount ELSE 0 END), 0) AS total_income,
-      COALESCE(SUM(CASE WHEN type = 'EXPENSE' THEN amount ELSE 0 END), 0) AS total_expenses,
-      COALESCE(SUM(CASE WHEN type = 'REFUND'  THEN amount ELSE 0 END), 0) AS total_refunds,
-      COUNT(*)::bigint AS transaction_count
+      COALESCE(SUM(amount) FILTER (WHERE type = 'INCOME'),  0) AS income,
+      COALESCE(SUM(amount) FILTER (WHERE type = 'EXPENSE'), 0) AS expenses,
+      COALESCE(SUM(amount) FILTER (WHERE type = 'REFUND'),  0) AS refunds,
+      COUNT(*)                                                  AS transaction_count,
+      COUNT(*) FILTER (WHERE type = 'TRANSFER')                 AS transfer_count,
+      COUNT(*) FILTER (WHERE category_id IS NULL AND type <> 'TRANSFER') AS uncategorized_count
     FROM transactions
     WHERE user_id = ${userId}::uuid
-      AND type != 'TRANSFER'
-      AND occurred_at >= ${from}
-      AND occurred_at <  ${to}
+      AND occurred_at >= ${period.from}::timestamptz
+      AND occurred_at <  ${period.to}::timestamptz
   `;
 
-  const row = rows[0] ?? {
-    total_income: new Decimal(0),
-    total_expenses: new Decimal(0),
-    total_refunds: new Decimal(0),
-    transaction_count: BigInt(0),
-  };
-
-  const income = new Decimal(row.total_income);
-  const expenses = new Decimal(row.total_expenses);
-  const refunds = new Decimal(row.total_refunds);
-  const netExpenses = expenses.sub(refunds);
-  const netCashFlow = income.sub(netExpenses);
-  const savingsRateVal = income.isZero()
-    ? null
-    : income.sub(netExpenses).div(income).mul(100);
+  const income = new Decimal(row?.income ?? 0);
+  const expenses = new Decimal(row?.expenses ?? 0);
+  const refunds = new Decimal(row?.refunds ?? 0);
+  const { netExpenses, netCashFlow, savingsRate } = summarize({ income, expenses, refunds });
 
   return {
-    period: { year, month },
+    period: { year: period.year, month: period.month, label: formatYearMonth(period), timezone },
     currency: 'INR',
     totalIncome: serializeAmount(income),
     totalExpenses: serializeAmount(expenses),
     totalRefunds: serializeAmount(refunds),
     netExpenses: serializeAmount(netExpenses),
     netCashFlow: serializeAmount(netCashFlow),
-    savingsRate: savingsRateVal ? serializeAmount(savingsRateVal) : null,
-    transactionCount: Number(row.transaction_count),
+    savingsRate: serializePercent(savingsRate), // null when income is zero (undefined, not 0%)
+    transactionCount: Number(row?.transaction_count ?? 0),
+    transferCount: Number(row?.transfer_count ?? 0),
+    uncategorizedCount: Number(row?.uncategorized_count ?? 0),
   };
 }
 
-// ── Category Breakdown ────────────────────────────────────────────────────────
+// ── Category breakdown (with month-over-month) ─────────────────────────────────
 
-export async function getCategoryBreakdown(
-  userId: string,
-  userTimezone: string,
-  year?: number,
-  month?: number,
-) {
-  const ym = year && month ? { year, month } : currentYearMonth(userTimezone);
-  const { from, to } = monthBoundaries(ym.year, ym.month, userTimezone);
+export async function getCategoryBreakdown(userId: string, timezone: string, year?: number, month?: number) {
+  const period = resolvePeriod(timezone, year, month);
+  const prev = addMonths(period, -1);
+  const prevFrom = monthBoundaries(prev.year, prev.month, timezone).from;
 
-  const rows = await prisma.$queryRaw<CategoryBreakdownRow[]>`
+  const rows = await prisma.$queryRaw<
+    Array<{
+      category_id: string | null; category_name: string | null; color: string | null;
+      total: Money; previous_total: Money; transaction_count: bigint;
+    }>
+  >`
     SELECT
-      t.category_id,
-      c.name AS category_name,
-      COALESCE(SUM(
-        CASE WHEN t.type = 'REFUND' THEN -t.amount ELSE t.amount END
-      ), 0) AS total,
-      COUNT(*)::bigint AS transaction_count
+      t.category_id::text AS category_id,
+      c.name              AS category_name,
+      c.color             AS color,
+      COALESCE(SUM(CASE WHEN t.type = 'REFUND' THEN -t.amount ELSE t.amount END)
+        FILTER (WHERE t.occurred_at >= ${period.from}::timestamptz AND t.occurred_at < ${period.to}::timestamptz), 0) AS total,
+      COALESCE(SUM(CASE WHEN t.type = 'REFUND' THEN -t.amount ELSE t.amount END)
+        FILTER (WHERE t.occurred_at >= ${prevFrom}::timestamptz AND t.occurred_at < ${period.from}::timestamptz), 0) AS previous_total,
+      COUNT(*) FILTER (WHERE t.occurred_at >= ${period.from}::timestamptz AND t.occurred_at < ${period.to}::timestamptz) AS transaction_count
     FROM transactions t
     LEFT JOIN categories c ON c.id = t.category_id
     WHERE t.user_id = ${userId}::uuid
       AND t.type IN ('EXPENSE', 'REFUND')
-      AND occurred_at >= ${from}
-      AND occurred_at <  ${to}
-    GROUP BY t.category_id, c.name
-    ORDER BY total DESC
+      AND t.occurred_at >= ${prevFrom}::timestamptz
+      AND t.occurred_at <  ${period.to}::timestamptz
+    GROUP BY t.category_id, c.name, c.color
+    ORDER BY total DESC, c.name
   `;
 
-  const grandTotal = rows.reduce(
-    (sum: Decimal, r: CategoryBreakdownRow) => sum.add(new Decimal(r.total)),
-    new Decimal(0),
-  );
+  const total = rows.reduce((s, r) => s.add(r.total), ZERO);
 
-  return rows.map((r: CategoryBreakdownRow) => {
-    const total = new Decimal(r.total);
-    const pct = grandTotal.isZero() ? null : total.div(grandTotal).mul(100);
-    return {
-      categoryId: r.category_id,
-      categoryName: r.category_name ?? 'Uncategorized',
-      total: serializeAmount(total),
-      percentage: pct ? serializeAmount(pct) : null,
-      transactionCount: Number(r.transaction_count),
-    };
-  });
+  return {
+    period: { year: period.year, month: period.month, label: formatYearMonth(period) },
+    currency: 'INR',
+    total: serializeAmount(total),
+    categories: rows.map((r) => {
+      const current = new Decimal(r.total);
+      const previous = new Decimal(r.previous_total);
+      return {
+        categoryId: r.category_id,
+        categoryName: r.category_name ?? 'Uncategorized',
+        color: r.color,
+        total: serializeAmount(current),
+        percentage: serializePercent(percentOf(current, total)),
+        previousTotal: serializeAmount(previous),
+        changePct: serializePercent(previous.isZero() ? null : percentOf(current.sub(previous), previous.abs())),
+        transactionCount: Number(r.transaction_count),
+      };
+    }),
+  };
 }
 
-// ── Monthly Trends with LAG window function ───────────────────────────────────
+// ── Monthly trends ─────────────────────────────────────────────────────────────
 
-export async function getMonthlyTrends(userId: string, userTimezone: string, months = 12) {
-  // DATE_TRUNC in user timezone using AT TIME ZONE
-  const rows = await prisma.$queryRaw<TrendRow[]>`
-    WITH monthly AS (
+export async function getMonthlyTrends(userId: string, timezone: string, months: number, now: Date = new Date()) {
+  const end = currentYearMonth(timezone, now);
+  const start = addMonths(end, -(months - 1));
+  const from = monthBoundaries(start.year, start.month, timezone).from;
+  const to = monthBoundaries(end.year, end.month, timezone).to;
+
+  // generate_series guarantees a row for every month (zeros where nothing happened), so LAG
+  // compares genuinely adjacent months instead of skipping over empty ones.
+  const rows = await prisma.$queryRaw<
+    Array<{
+      month: string; income: Money; expenses: Money; refunds: Money;
+      prev_income: Money | null; prev_net_expenses: Money | null;
+    }>
+  >`
+    WITH months AS (
+      SELECT generate_series(
+        make_date(${start.year}::int, ${start.month}::int, 1)::timestamp,
+        make_date(${end.year}::int,   ${end.month}::int,   1)::timestamp,
+        interval '1 month') AS month
+    ),
+    monthly AS (
       SELECT
-        DATE_TRUNC('month', occurred_at AT TIME ZONE ${userTimezone}) AS month,
-        COALESCE(SUM(CASE WHEN type = 'INCOME'  THEN amount ELSE 0 END), 0) AS income,
-        COALESCE(SUM(CASE WHEN type = 'EXPENSE' THEN amount ELSE 0 END), 0) AS expenses,
-        COALESCE(SUM(CASE WHEN type = 'REFUND'  THEN amount ELSE 0 END), 0) AS refunds
+        date_trunc('month', occurred_at AT TIME ZONE ${timezone}) AS month,
+        SUM(amount) FILTER (WHERE type = 'INCOME')  AS income,
+        SUM(amount) FILTER (WHERE type = 'EXPENSE') AS expenses,
+        SUM(amount) FILTER (WHERE type = 'REFUND')  AS refunds
       FROM transactions
       WHERE user_id = ${userId}::uuid
-        AND type != 'TRANSFER'
-        AND occurred_at >= (NOW() AT TIME ZONE ${userTimezone} - INTERVAL '1 month' * ${months})
+        AND occurred_at >= ${from}::timestamptz
+        AND occurred_at <  ${to}::timestamptz
       GROUP BY 1
+    ),
+    filled AS (
+      SELECT m.month,
+             COALESCE(x.income, 0)   AS income,
+             COALESCE(x.expenses, 0) AS expenses,
+             COALESCE(x.refunds, 0)  AS refunds
+      FROM months m LEFT JOIN monthly x ON x.month = m.month
     )
     SELECT
-      month,
-      income,
-      expenses,
-      refunds,
-      LAG(income,   1) OVER (ORDER BY month) AS prev_income,
-      LAG(expenses, 1) OVER (ORDER BY month) AS prev_expenses
-    FROM monthly
-    ORDER BY month ASC
+      to_char(month, 'YYYY-MM') AS month,
+      income, expenses, refunds,
+      LAG(income)               OVER w AS prev_income,
+      LAG(expenses - refunds)   OVER w AS prev_net_expenses
+    FROM filled
+    WINDOW w AS (ORDER BY month)
+    ORDER BY month
   `;
 
-  return rows.map((r: TrendRow) => {
-    const income = new Decimal(r.income);
-    const expenses = new Decimal(r.expenses).sub(new Decimal(r.refunds));
-    const prevIncome = r.prev_income ? new Decimal(r.prev_income) : null;
-    const prevExpenses = r.prev_expenses ? new Decimal(r.prev_expenses) : null;
+  return {
+    currency: 'INR',
+    months: rows.map((r) => {
+      const income = new Decimal(r.income);
+      const netExpenses = new Decimal(r.expenses).sub(r.refunds);
+      const { netCashFlow, savingsRate } = summarize({ income, expenses: new Decimal(r.expenses), refunds: new Decimal(r.refunds) });
+      const change = (cur: Decimal, prev: Money | null) =>
+        prev === null || new Decimal(prev).isZero() ? null : percentOf(cur.sub(prev), new Decimal(prev).abs());
+      return {
+        month: r.month,
+        income: serializeAmount(income),
+        netExpenses: serializeAmount(netExpenses),
+        netCashFlow: serializeAmount(netCashFlow),
+        savingsRate: serializePercent(savingsRate),
+        incomeChangePct: serializePercent(change(income, r.prev_income)),
+        expenseChangePct: serializePercent(change(netExpenses, r.prev_net_expenses)),
+      };
+    }),
+  };
+}
 
-    const incomeChange =
-      prevIncome && !prevIncome.isZero()
-        ? income.sub(prevIncome).div(prevIncome).mul(100)
-        : null;
-    const expenseChange =
-      prevExpenses && !prevExpenses.isZero()
-        ? expenses.sub(prevExpenses).div(prevExpenses).mul(100)
-        : null;
+// ── Helpers reused by insights ─────────────────────────────────────────────────
 
-    return {
-      month: r.month,
-      income: serializeAmount(income),
-      netExpenses: serializeAmount(expenses),
-      incomeChangePct: incomeChange ? serializeAmount(incomeChange) : null,
-      expenseChangePct: expenseChange ? serializeAmount(expenseChange) : null,
-    };
-  });
+/** Net expenses (EXPENSE - REFUND) inside [from, to). */
+export async function netExpensesBetween(userId: string, from: Date, to: Date): Promise<Decimal> {
+  const [row] = await prisma.$queryRaw<Array<{ net: Money }>>`
+    SELECT COALESCE(SUM(CASE WHEN type = 'REFUND' THEN -amount ELSE amount END), 0) AS net
+    FROM transactions
+    WHERE user_id = ${userId}::uuid
+      AND type IN ('EXPENSE', 'REFUND')
+      AND occurred_at >= ${from}::timestamptz
+      AND occurred_at <  ${to}::timestamptz
+  `;
+  return new Decimal(row?.net ?? 0);
 }

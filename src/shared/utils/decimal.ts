@@ -1,62 +1,56 @@
 // src/shared/utils/decimal.ts
-// Safe Decimal arithmetic wrappers.
-// All monetary computation must go through these helpers — never use JS number for money.
-// Prisma Decimal fields return Decimal (backed by decimal.js).
+// Decimal helpers. All monetary computation goes through Decimal - never JS numbers.
+// Prisma's Decimal (decimal.js) is the single implementation used across the codebase.
 
-import { Decimal } from '@prisma/client/runtime/library';
+import { Prisma } from '@prisma/client';
 
-export { Decimal };
-export type MoneyDecimal = Decimal;
+export const Decimal = Prisma.Decimal;
+export type Decimal = Prisma.Decimal;
+
+export type DecimalValue = string | number | Decimal;
+
+export const ZERO = new Decimal(0);
+const HUNDRED = new Decimal(100);
 
 /** Parse a string or number into a Decimal. Throws if not a valid finite number. */
-export function toDecimal(value: string | number): Decimal {
+export function toDecimal(value: string | number | Decimal): Decimal {
   const d = new Decimal(value);
-  if (!d.isFinite()) {
-    throw new Error(`Invalid monetary value: ${value}`);
-  }
+  if (!d.isFinite()) throw new Error(`Invalid monetary value: ${String(value)}`);
   return d;
 }
 
-/** Serialize a Decimal for API responses. Always a string to avoid float precision loss. */
-export function serializeAmount(d: Decimal): string {
-  return d.toFixed(2);
+/** Serialize money for API responses: always a 2-dp string to avoid float precision loss. */
+export function serializeAmount(d: DecimalValue): string {
+  return new Decimal(d).toFixed(2);
 }
 
-/** Add two Decimals */
-export function addDecimal(a: Decimal, b: Decimal): Decimal {
-  return a.add(b);
+/** Sum a list of Decimals (empty list -> 0). */
+export function sum(values: Iterable<DecimalValue>): Decimal {
+  let total = new Decimal(0);
+  for (const v of values) total = total.add(v);
+  return total;
 }
 
-/** Subtract b from a */
-export function subtractDecimal(a: Decimal, b: Decimal): Decimal {
-  return a.sub(b);
+/** a / b as a percentage (0-100 scale), or null when b is zero. */
+export function percentOf(a: DecimalValue, b: DecimalValue): Decimal | null {
+  const denom = new Decimal(b);
+  if (denom.isZero()) return null;
+  return new Decimal(a).div(denom).mul(HUNDRED);
 }
 
-/** Multiply two Decimals */
-export function multiplyDecimal(a: Decimal, b: Decimal): Decimal {
-  return a.mul(b);
+/** Percentage string with 2 dp, or null. */
+export function serializePercent(p: Decimal | null): string | null {
+  return p === null ? null : p.toFixed(2);
 }
 
-/** Divide a by b. Returns null if b is zero. */
-export function divideDecimal(
-  a: Decimal,
-  b: Decimal,
-): Decimal | null {
-  if (b.isZero()) return null;
-  return a.div(b);
+export function maxDecimal(a: DecimalValue, b: DecimalValue): Decimal {
+  return Decimal.max(a, b);
 }
 
-/** Zero constant */
-export const ZERO = new Decimal(0);
-
-/** Compute savings rate. Returns null if income is zero. Result is 0-100. */
-export function savingsRate(
-  income: Decimal,
-  expenses: Decimal,
-): Decimal | null {
-  if (income.isZero()) return null;
-  const netSavings = subtractDecimal(income, expenses);
-  const rate = divideDecimal(netSavings, income);
-  if (!rate) return null;
-  return multiplyDecimal(rate, new Decimal(100));
+/**
+ * Savings rate = (income - netExpenses) / income x 100. Returns null when income is zero
+ * (the ratio is undefined, not zero). Negative when the user spent more than they earned.
+ */
+export function savingsRate(income: DecimalValue, netExpenses: DecimalValue): Decimal | null {
+  return percentOf(new Decimal(income).sub(netExpenses), income);
 }

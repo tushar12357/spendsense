@@ -1,22 +1,22 @@
 // src/modules/imports/adapters/registry.ts
-// Adapter registry — maps adapter keys to adapter instances.
-// Add new adapters here; the pipeline discovers them via this registry.
+// Adapter registry. Add new bank formats here; the pipeline discovers them by key or by header sniffing.
 
 import type { BankStatementAdapter } from './adapter.interface';
 import { hdfcCsvAdapter } from './hdfc-csv/hdfc-csv.adapter';
+import { genericCsvAdapter } from './generic-csv/generic-csv.adapter';
 
-const adapters: Map<string, BankStatementAdapter> = new Map([
-  [hdfcCsvAdapter.key, hdfcCsvAdapter],
-]);
+// Order matters for auto-detection: bank-specific adapters first, the generic one last.
+const adapters: BankStatementAdapter[] = [hdfcCsvAdapter, genericCsvAdapter];
+const byKey = new Map(adapters.map((a) => [a.key, a]));
 
-export function getAdapter(key: string): BankStatementAdapter {
-  const adapter = adapters.get(key);
-  if (!adapter) {
-    throw new Error(`Unknown adapter: "${key}". Available: ${[...adapters.keys()].join(', ')}`);
-  }
-  return adapter;
+export function getAdapter(key: string): BankStatementAdapter | undefined {
+  return byKey.get(key);
 }
 
-export function listAdapters(): Array<{ key: string; displayName: string }> {
-  return [...adapters.values()].map(({ key, displayName }) => ({ key, displayName }));
+export function detectAdapter(headers: string[]): BankStatementAdapter | undefined {
+  return adapters.find((a) => a.matches(headers));
+}
+
+export function listAdapters() {
+  return adapters.map(({ key, displayName, expectedColumns }) => ({ key, displayName, expectedColumns }));
 }

@@ -1,54 +1,66 @@
 // src/shared/validation/pagination.schema.ts
-// Reusable cursor pagination Zod schemas.
-// Cursor is an opaque base64-encoded string wrapping { id, occurredAt }.
+// Cursor (keyset) pagination helpers. A cursor is an opaque base64url token wrapping the sort key
+// of the last row returned: (occurredAt DESC, id ASC) for the ledger, rowNumber for import rows.
 
 import { z } from 'zod';
+import { AppError } from '../errors/AppError';
+
+export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export const uuidSchema = z.string().regex(UUID_RE, 'Must be a UUID');
 
 export const paginationQuerySchema = z.object({
-  cursor: z.string().optional(),
+  cursor: z.string().max(512).optional(),
   limit: z.coerce.number().int().min(1).max(200).default(50),
 });
 
-export type PaginationQuery = z.infer<typeof paginationQuerySchema>;
-
-/** Encode a cursor from a transaction's sort fields */
-export function encodeCursor(id: string, occurredAt: Date): string {
-  const payload = JSON.stringify({ id, occurredAt: occurredAt.toISOString() });
-  return Buffer.from(payload, 'utf8').toString('base64url');
+function encode(payload: unknown): string {
+  return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
 }
 
-/** Decode a cursor. Returns null on invalid input. */
-export function decodeCursor(cursor: string): { id: string; occurredAt: Date } | null {
+function decode(cursor: string): unknown {
   try {
-    const json = Buffer.from(cursor, 'base64url').toString('utf8');
-    const parsed = JSON.parse(json) as { id: string; occurredAt: string };
-    if (typeof parsed.id !== 'string' || typeof parsed.occurredAt !== 'string') return null;
-    return { id: parsed.id, occurredAt: new Date(parsed.occurredAt) };
+    return JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
   } catch {
     return null;
   }
 }
 
-export interface PaginatedResponse<T> {
-  data: T[];
-  pagination: {
-    hasMore: boolean;
-    nextCursor: string | null;
-    count: number;
-  };
+/** Ledger cursor: sort key of the last transaction on the page. */
+export function encodeCursor(id: string, occurredAt: Date): string {
+  return encode({ id, occurredAt: occurredAt.toISOString() });
 }
 
-export function buildPaginatedResponse<T extends { id: string; occurredAt?: Date }>(
-  items: T[],
-  limit: number,
-): PaginatedResponse<T> {
-  const hasMore = items.length > limit;
-  const data = hasMore ? items.slice(0, limit) : items;
-  const last = data[data.length - 1];
-  const nextCursor =
-    hasMore && last && last.occurredAt
-      ? encodeCursor(last.id, last.occurredAt)
-      : null;
+/** Decodes and validates a ledger cursor. Throws a 400 AppError on any malformed input. */
+export function decodeCursor(cursor: string): { id: string; occurredAt: Date } {
+  const parsed = decode(cursor) as { id?: unknown; occurredAt?: unknown } | null;
+  if (
+    !parsed ||
+    typeof parsed.id !== 'string' ||
+    !UUID_RE.test(parsed.id) ||
+    typeof parsed.occurredAt !== 'string'
+  ) {
+    throw AppError.badRequest('Invalid cursor');
+  }
+  const occurredAt = new Date(parsed.occurredAt);
+  if (Number.isNaN(occurredAt.getTime())) throw AppError.badRequest('Invalid cursor');
+  return { id: parsed.id, occurredAt };
+}
 
-  return { data, pagination: { hasMore, nextCursor, count: data.length } };
+/** Row-number cursor used for import rows. */
+export function encodeRowCursor(rowNumber: number): string {
+  return encode({ r: rowNumber });
+}
+
+export function decodeRowCursor(cursor: string): number {
+  const parsed = decode(cursor) as { r?: unknown } | null;
+  if (!parsed || typeof parsed.r !== 'number' || !Number.isInteger(parsed.r) || parsed.r < 0) {
+    throw AppError.badRequest('Invalid cursor');
+  }
+  return parsed.r;
+}
+
+export interface PaginatedResponse<T> {
+  data: T[];
+  pagination: { hasMore: boolean; nextCursor: string | null; count: number };
 }

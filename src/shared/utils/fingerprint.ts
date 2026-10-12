@@ -1,47 +1,44 @@
 // src/shared/utils/fingerprint.ts
-// Generates a content-based fingerprint for duplicate detection.
-// Used as a SECONDARY check — the primary is source_tx_id uniqueness.
-// A fingerprint match is a CANDIDATE duplicate, not a definitive duplicate.
+// Content fingerprints for SECONDARY duplicate detection.
+//
+// The primary guard is the (account_id, source_tx_id) unique constraint. When a statement has no
+// bank reference we fall back to a fingerprint of account + local date + amount + description.
+//
+// A fingerprint alone does not prove duplication: two real purchases can share all four fields.
+// To stay conservative, the fingerprint also carries an *occurrence ordinal* - "this is the 2nd
+// identical row in this file". That way:
+//   - two identical coffees inside ONE statement get different fingerprints and are both kept;
+//   - re-importing an overlapping statement matches occurrence 1 with 1, 2 with 2, and so on,
+//     so only genuinely repeated rows are flagged, and an extra legitimate purchase still imports.
 
-import { createHash } from 'crypto';
+import { createHash } from 'node:crypto';
 
-interface FingerprintInput {
+export interface FingerprintInput {
   accountId: string;
-  occurredAt: Date;
-  amount: string;       // Decimal serialized as string e.g. "1234.50"
+  /** Calendar date in the user's timezone, YYYY-MM-DD. */
+  localDate: string;
+  /** Decimal serialized with 2 fraction digits, e.g. "1234.50". */
+  amount: string;
   description: string;
+  /** 1-based occurrence of this exact (date, amount, description) within the source file. */
+  ordinal?: number;
 }
 
-/**
- * Normalize a description for fingerprinting:
- * - Lowercase
- * - Remove common noise (multiple spaces, punctuation runs)
- * - Trim
- */
+/** Lowercase, collapse whitespace, strip punctuation so cosmetic differences do not matter. */
 export function normalizeDescription(description: string): string {
   return description
     .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, ' ')
     .replace(/\s+/g, ' ')
-    .replace(/[^a-z0-9 ]/g, '')
     .trim();
 }
 
-/**
- * Generate a SHA-256 fingerprint.
- * The fingerprint encodes: accountId + date (YYYY-MM-DD) + amount (fixed 2dp) + normalized description.
- * Two transactions with the same fingerprint in the same account on the same date are CANDIDATE duplicates.
- */
-export function generateFingerprint(input: FingerprintInput): string {
-  const datePart = input.occurredAt.toISOString().slice(0, 10); // YYYY-MM-DD
-  const normalized = normalizeDescription(input.description);
-  const payload = `${input.accountId}|${datePart}|${input.amount}|${normalized}`;
-  return createHash('sha256').update(payload, 'utf8').digest('hex');
+/** Key shared by every row that could be "the same transaction" (without the ordinal). */
+export function fingerprintBaseKey(input: Omit<FingerprintInput, 'ordinal'>): string {
+  return `${input.accountId}|${input.localDate}|${input.amount}|${normalizeDescription(input.description)}`;
 }
 
-/**
- * Check if two fingerprints match (trivial equality).
- * Split out so tests can verify the comparison logic independently.
- */
-export function fingerprintsMatch(a: string, b: string): boolean {
-  return a === b;
+export function generateFingerprint(input: FingerprintInput): string {
+  const payload = `${fingerprintBaseKey(input)}|${input.ordinal ?? 1}`;
+  return createHash('sha256').update(payload, 'utf8').digest('hex');
 }

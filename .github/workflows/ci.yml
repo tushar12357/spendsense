@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: spendsense_test
+          POSTGRES_PASSWORD: spendsense_test
+          POSTGRES_DB: spendsense_test
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U spendsense_test" --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgresql://spendsense_test:spendsense_test@localhost:5433/spendsense_test?schema=public
+      DATABASE_URL: postgresql://spendsense_test:spendsense_test@localhost:5433/spendsense_test?schema=public
+      JWT_SECRET: ci-only-secret-ci-only-secret-ci-only-secret
+      REDIS_TEST: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Type-check
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+      - name: Verify the Prisma schema matches the migration history
+        run: |
+          npx prisma migrate deploy
+          npx prisma migrate diff --from-url "$DATABASE_URL" --to-schema-datamodel prisma/schema.prisma --exit-code
+      - name: Tests (unit + integration, including the Redis/BullMQ suite)
+        run: npm test

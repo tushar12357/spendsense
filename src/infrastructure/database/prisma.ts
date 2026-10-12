@@ -1,51 +1,54 @@
 // src/infrastructure/database/prisma.ts
-// Singleton PrismaClient instance.
-// Re-uses a single connection pool across the application.
-// In test environments, each test file should manage its own transactions or cleanup.
+// Singleton PrismaClient. One connection pool per process; survives tsx hot-reloads in dev.
 
 import { Prisma, PrismaClient } from '@prisma/client';
 import { env } from '../../config/env';
 import { logger } from '../logging/logger';
 
 declare global {
-  // Allow a global singleton in development to survive hot-reloads
   // eslint-disable-next-line no-var
   var __prisma: PrismaClient | undefined;
 }
 
 function createPrismaClient(): PrismaClient {
   const client = new PrismaClient({
-    log:
-      env.NODE_ENV === 'development'
-        ? [
-            { emit: 'event', level: 'query' },
-            { emit: 'event', level: 'error' },
-            { emit: 'event', level: 'warn' },
-          ]
-        : [{ emit: 'event', level: 'error' }],
+    log: [
+      { emit: 'event', level: 'query' },
+      { emit: 'event', level: 'error' },
+      { emit: 'event', level: 'warn' },
+    ],
     errorFormat: 'minimal',
   });
 
-  if (env.NODE_ENV === 'development') {
-    // Log slow queries — helpful for identifying missing indexes
-    (client as any).$on('query', (e: Prisma.QueryEvent) => {
-      if (e.duration > 100) {
-        logger.warn({ duration: e.duration, query: e.query }, 'slow query');
-      }
-    });
-  }
+  const events = client as unknown as {
+    $on(event: 'query' | 'error' | 'warn', cb: (e: never) => void): void;
+  };
 
-  (client as any).$on('error', (e: Prisma.LogEvent) => {
+  // Only slow queries are logged; bound parameters are never logged (they hold financial data).
+  events.$on('query', ((e: Prisma.QueryEvent) => {
+    if (e.duration >= env.SLOW_QUERY_MS) {
+      logger.warn({ durationMs: e.duration, query: e.query.slice(0, 500) }, 'slow query');
+    }
+  }) as (e: never) => void);
+  events.$on('error', ((e: Prisma.LogEvent) => {
     logger.error({ message: e.message, target: e.target }, 'prisma error');
-  });
+  }) as (e: never) => void);
+  events.$on('warn', ((e: Prisma.LogEvent) => {
+    logger.warn({ message: e.message, target: e.target }, 'prisma warning');
+  }) as (e: never) => void);
 
   return client;
 }
 
-export const prisma: PrismaClient =
-  global.__prisma ?? (global.__prisma = createPrismaClient());
+export const prisma: PrismaClient = (globalThis.__prisma ??= createPrismaClient());
 
-// Graceful disconnect helper used in server.ts and test teardown
+export type Tx = Prisma.TransactionClient;
+
 export async function disconnectPrisma(): Promise<void> {
   await prisma.$disconnect();
+}
+
+/** Cheap connectivity probe for the readiness endpoint. */
+export async function pingDatabase(): Promise<void> {
+  await prisma.$queryRaw`SELECT 1`;
 }

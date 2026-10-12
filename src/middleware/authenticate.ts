@@ -7,6 +7,10 @@ import jwt from 'jsonwebtoken';
 import { env } from '../config/env';
 import { AppError } from '../shared/errors/AppError';
 
+export const JWT_ISSUER = 'spendsense';
+export const JWT_AUDIENCE = 'spendsense-api';
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export interface JwtPayload {
   sub: string;   // user UUID
   email: string;
@@ -34,13 +38,19 @@ export function authenticate(req: Request, _res: Response, next: NextFunction): 
 
   try {
     const payload = jwt.verify(token, env.JWT_SECRET, {
-      issuer: 'spendsense',
-      audience: 'spendsense-api',
+      algorithms: ['HS256'], // pin the algorithm; never trust the token header
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
     }) as JwtPayload;
+
+    if (typeof payload.sub !== 'string' || !UUID_RE.test(payload.sub)) {
+      throw AppError.unauthorized('Invalid token');
+    }
 
     req.user = payload;
     next();
   } catch (err) {
+    if (err instanceof AppError) throw err;
     if (err instanceof jwt.TokenExpiredError) {
       throw AppError.unauthorized('Token expired');
     }

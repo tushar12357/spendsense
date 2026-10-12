@@ -101,6 +101,9 @@ model Account {
 
   /// Prevents accidental creation of two accounts with identical names for the same user.
   @@unique([userId, name])
+  /// Target of composite FKs on transactions / import_batches so a row can never
+  /// reference an account owned by a different user (enforced by the database).
+  @@unique([id, userId])
   @@index([userId])
   @@map("accounts")
 }
@@ -143,7 +146,8 @@ model Category {
 model MerchantRule {
   id             String   @id @default(uuid()) @db.Uuid
   userId         String   @map("user_id") @db.Uuid
-  /// Regex pattern matched against transaction description (case-insensitive).
+  /// Case-insensitive substring matched against the transaction description.
+  /// (Deliberately not a regex: user-supplied regexes are a ReDoS risk.)
   pattern        String
   categoryId     String   @map("category_id") @db.Uuid
   /// Canonical merchant name to assign after matching.
@@ -191,7 +195,7 @@ model Transaction {
   updatedAt   DateTime        @updatedAt @map("updated_at") @db.Timestamptz
 
   user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
-  account      Account      @relation(fields: [accountId], references: [id])
+  account      Account      @relation(fields: [accountId, userId], references: [id, userId])
   category     Category?    @relation(fields: [categoryId], references: [id])
   importRow    ImportRow?   @relation("TransactionImportRow", fields: [importRowId], references: [id])
   linkedImportRow ImportRow? @relation("ImportRowTransaction")
@@ -204,7 +208,7 @@ model Transaction {
   @@index([userId, type])                        // type filter
   @@index([userId, categoryId])                  // category analytics
   @@index([accountId, occurredAt(sort: Desc)])   // account-scoped ledger
-  @@index([fingerprint])                         // fingerprint lookup for duplicate detection
+  @@index([accountId, fingerprint])              // fingerprint lookup for duplicate detection
   @@map("transactions")
 }
 
@@ -229,6 +233,8 @@ model ImportBatch {
   rejectedRows Int         @default(0) @map("rejected_rows")
   skippedRows Int          @default(0) @map("skipped_rows")
   warningCount Int         @default(0) @map("warning_count")
+  /// Number of processing attempts (worker retries / re-uploads of a failed file).
+  attempts    Int          @default(0)
   /// Structured error metadata (e.g. adapter parse failure reason).
   errorMeta   Json?        @map("error_meta")
   startedAt   DateTime?    @map("started_at") @db.Timestamptz
@@ -237,7 +243,7 @@ model ImportBatch {
   updatedAt   DateTime     @updatedAt @map("updated_at") @db.Timestamptz
 
   user    User        @relation(fields: [userId], references: [id], onDelete: Cascade)
-  account Account     @relation(fields: [accountId], references: [id])
+  account Account     @relation(fields: [accountId, userId], references: [id, userId])
   rows    ImportRow[]
 
   /// Prevents the same file from creating a second batch for the same user.

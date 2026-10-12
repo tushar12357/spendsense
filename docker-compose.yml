@@ -1,3 +1,7 @@
+# Local infrastructure:   docker compose up -d            (postgres, redis, postgres_test)
+# Full stack in Docker:   docker compose --profile app up -d --build
+#
+# Passwords below are LOCAL DEVELOPMENT defaults only. Never reuse them anywhere real.
 
 services:
   postgres:
@@ -13,7 +17,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-spendsense}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-spendsense} -d ${POSTGRES_DB:-spendsense}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -24,7 +28,8 @@ services:
     restart: unless-stopped
     ports:
       - "${REDIS_PORT:-6379}:6379"
-    command: redis-server --save 60 1 --loglevel warning
+    # BullMQ needs the queue to survive restarts; "noeviction" stops Redis from silently dropping jobs.
+    command: redis-server --save 60 1 --loglevel warning --maxmemory-policy noeviction
     volumes:
       - redis_data:/data
     healthcheck:
@@ -33,6 +38,7 @@ services:
       timeout: 5s
       retries: 5
 
+  # Dedicated database for the automated tests. Its tables are truncated between tests.
   postgres_test:
     image: postgres:16-alpine
     container_name: spendsense_postgres_test
@@ -43,15 +49,65 @@ services:
       POSTGRES_DB: ${TEST_POSTGRES_DB:-spendsense_test}
     ports:
       - "${TEST_POSTGRES_PORT:-5433}:5432"
-    volumes:
-      - postgres_test_data:/var/lib/postgresql/data
+    # Tests do not need durability: trade it for speed.
+    command: postgres -c fsync=off -c synchronous_commit=off -c full_page_writes=off
+    tmpfs:
+      - /var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${TEST_POSTGRES_USER:-spendsense_test}"]
-      interval: 10s
+      test: ["CMD-SHELL", "pg_isready -U ${TEST_POSTGRES_USER:-spendsense_test} -d ${TEST_POSTGRES_DB:-spendsense_test}"]
+      interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+
+  # ── Application containers (opt-in:  --profile app) ────────────────────────────
+  migrate:
+    profiles: ["app"]
+    build: .
+    command: ["npx", "prisma", "migrate", "deploy"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-spendsense}:${POSTGRES_PASSWORD:-spendsense_dev}@postgres:5432/${POSTGRES_DB:-spendsense}?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    profiles: ["app"]
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${PORT:-5000}:5000"
+    environment: &app-env
+      NODE_ENV: production
+      PORT: 5000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-spendsense}:${POSTGRES_PASSWORD:-spendsense_dev}@postgres:5432/${POSTGRES_DB:-spendsense}?schema=public
+      REDIS_HOST: redis
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET (>= 32 chars) in .env}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+      IMPORT_ASYNC: "true"
+      UPLOAD_TEMP_DIR: /app/tmp/uploads
+    volumes:
+      - uploads:/app/tmp/uploads   # shared with the worker: the API parks files, the worker reads them
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  worker:
+    profiles: ["app"]
+    build: .
+    restart: unless-stopped
+    command: ["node", "dist/worker.js"]
+    environment: *app-env
+    volumes:
+      - uploads:/app/tmp/uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
 
 volumes:
   postgres_data:
   redis_data:
-  postgres_test_data:
+  uploads:

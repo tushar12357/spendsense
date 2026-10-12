@@ -1,22 +1,30 @@
 // src/infrastructure/logging/logger.ts
-// Structured logger using pino. Attaches requestId from AsyncLocalStorage context.
+// Structured logger (pino). Redacts credentials and financial payloads.
 
 import pino from 'pino';
 import { env } from '../../config/env';
 
 export const logger = pino({
-  level: env.LOG_LEVEL,
-  // Redact sensitive fields from logs — financial data, credentials, tokens
+  level: env.NODE_ENV === 'test' && env.LOG_LEVEL === 'info' ? 'silent' : env.LOG_LEVEL,
+  base: { service: 'spendsense-api' },
   redact: {
     paths: [
       'req.headers.authorization',
       'req.headers.cookie',
-      'body.password',
-      'body.passwordHash',
       'password',
+      'newPassword',
+      'currentPassword',
+      'passwordHash',
       'token',
       'accessToken',
       'refreshToken',
+      // Financial payloads must never reach logs
+      'rawData',
+      'normalizedData',
+      'description',
+      '*.password',
+      '*.rawData',
+      '*.description',
     ],
     censor: '[REDACTED]',
   },
@@ -29,7 +37,7 @@ export const logger = pino({
     ? {
         transport: {
           target: 'pino-pretty',
-          options: { colorize: true, translateTime: 'SYS:standard', ignore: 'pid,hostname' },
+          options: { colorize: true, translateTime: 'SYS:standard', ignore: 'pid,hostname,service' },
         },
       }
     : {}),

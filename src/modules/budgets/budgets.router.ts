@@ -8,5 +8,6 @@ router.use(authenticate);
 
 router.get('/', controller.list);
 router.put('/:categoryId', controller.upsert);
+router.delete('/:categoryId', controller.remove);
 
 export { router as budgetsRouter };
